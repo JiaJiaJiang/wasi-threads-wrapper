@@ -12,7 +12,7 @@ const randomId = () => Math.floor(Math.random() * MAX_UINT32).toString(36);
  */
 class WrapperInstance {
 	namespace;
-	role;
+	role;				//"wasi_main" or "wasi_worker"
 	atomicArray;		//for all WrapperInstance,created by js main thread
 	wasmModule;			//for all wasi workers,created by js main thread
 	memory;				//for all wasi workers,created by js main thread
@@ -268,13 +268,13 @@ export async function initWasiWorker(configFunc) {
 			//(optional) additional importObject for WebAssembly.instantiate method
 			wasmImports = {},
 
-			//(optional) set to false if you don't want the namespace be auto destroyed when the entry method ends
+			//(optional) set to false if you don't want the namespace to be auto destroyed when the entry method ends
 			destroyWhenEnd = true,
 
-			//(optional) custom wasi instance,if presented,wasiOptions from main thread will be ignored
+			//(optional) custom wasi instance,if presented,wasiOptions from initWasiMain config will be ignored
 			wasi,
 
-			//(optional) do not run wasi.start on the instance
+			//(optional) do not run "wasi.start" on the instance
 			noWasiStart = false,
 		} = configFunc ? await configFunc(namespace, role) : {};
 		if (!wasi && !wasiOptions) throw (new Error('wasiOptions or wasi is required'));

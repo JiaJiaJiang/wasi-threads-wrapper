@@ -88,17 +88,24 @@ export async function initWasiWorker(configFunc);
 
 //here is a configFunc example
 async function configFunc(namespace, role){
+	//namespace is set by you in initWasiMain config
+	/* 
+		role can be "wasi_main" or "wasi_worker"
+		"wasi_main" is running in the main wasm thread
+		"wasi_worker" is running in threads which spawned by wasi_main
+	*/
+	//you can set different config for different namespaces and roles, but usually just set the same is enough
 	return {
 		//(optional) additional importObject for WebAssembly.instantiate method
 		wasmImports = {},
 		
-		//(optional) set to false if you don't want the namespace be auto destroyed when the entry method ends
+		//(optional) set to false if you don't want the namespace to be auto destroyed when the entry method ends
 		destroyWhenEnd = true,
 
-		//(optional) custom wasi instance,if presented,wasiOptions from main thread will be ignored
+		//(optional) custom wasi instance,if presented,wasiOptions from initWasiMain config will be ignored
 		wasi,
 
-		//(optional) do not run wasi.start on the instance
+		//(optional) do not run "wasi.start" on the instance
 		noWasiStart = false,
 	}
 }
