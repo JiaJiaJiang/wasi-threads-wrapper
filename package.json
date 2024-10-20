@@ -1,6 +1,6 @@
 {
   "name": "wasi-threads-wrapper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "a wrapper for wasm threads creation",
   "main": "index.mjs",
   "type": "module",
@@ -10,8 +10,8 @@
   "keywords": [
     "wasm",
     "webassembly",
-	"wasi",
-	"thread"
+    "wasi",
+    "thread"
   ],
   "author": "luojia@luojia.me",
   "license": "LGPL-2.1-only"
