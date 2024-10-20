@@ -35,7 +35,7 @@ It's very simple to use, just need to call the initialization method of this lib
 
 ```
 
-## Wasm imports and exports
+## Wasm features required
 
 Before using this wrapper, make sure your wasm program has enabled the following features, the wasi instance requires these to work:
 * atomics
@@ -90,11 +90,11 @@ export async function initWasiWorker(configFunc);
 async function configFunc(namespace, role){
 	//namespace is set by you in initWasiMain config
 	/* 
-		role can be "wasi_main" or "wasi_worker"
-		"wasi_main" is running in the main wasm thread
-		"wasi_worker" is running in threads which spawned by wasi_main
+	role can be "wasi_main" or "wasi_worker"
+	"wasi_main" is running in the main wasm thread
+	"wasi_worker" is running in threads which spawned by wasi_main
 	*/
-	//you can set different config for different namespaces and roles, but usually just set the same is enough
+	//you can set different config for different namespaces and roles, but usually just set the same one is enough
 	return {
 		//(optional) additional importObject for WebAssembly.instantiate method
 		wasmImports = {},
