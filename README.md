@@ -15,7 +15,7 @@ npm i wasi-threads-wrapper
 
 ## Usage
 
-It's very simple to use, just need to call the initialization method of this library in the main js thread and the worker entry file. Of course, you can also write everything in the same worker file, like this:
+It's very simple to use, just call the provided initialization method in the main js thread and the worker entry file. Of course, you can also write everything in the same worker file, like this:
 
 ```javascript
 (async () => {
