@@ -124,7 +124,6 @@ async function initWasi(wrapper, data, configFunc) {
 		role,
 	} = wrapper;
 	const {
-		destroy,
 		initMethod,//for wasi_main
 		wasiOptions,//for wasi_main and wasi_worker
 		instanceAddr,//for wasi_worker
@@ -285,7 +284,7 @@ export async function initWasiMain({
 		const helperWorker
 			= wrapper.helperWorkerPort
 			= wrapper.helperWorker
-			= new Worker('./helper.mjs', {
+			= new Worker(new URL(import.meta.resolve('./helper.mjs')), {
 				stdout: false,
 				stderr: false,
 			});
@@ -303,7 +302,7 @@ export async function initWasiMain({
 		}
 		async function startWasi() {
 			try {
-				const instance = await initWasi(wrapper, { destroy, initMethod, wasiOptions }, wasiConfigFunc);
+				const instance = await initWasi(wrapper, { initMethod, wasiOptions }, wasiConfigFunc);
 				instance.destroyThreads = destroy;
 				instanceCreateDone(instance);
 			} catch (err) {
@@ -347,7 +346,7 @@ export async function initWasiWorker(wasiConfigFunc) {
 					if (wrapper.role === 'wasi_worker') {
 						wrapper.helperWorkerPort = parentPort;
 						try {
-							const instance = await initWasi(wrapper, { destroy, ...msg.data }, wasiConfigFunc);
+							const instance = await initWasi(wrapper, msg.data, wasiConfigFunc);
 							instanceCreateDone(instance);
 						} catch (err) {
 							instanceCreateFail(err);
