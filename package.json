@@ -1,6 +1,6 @@
 {
   "name": "wasi-threads-wrapper",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "a wrapper for wasm threads creation",
   "main": "index.mjs",
   "type": "module",
