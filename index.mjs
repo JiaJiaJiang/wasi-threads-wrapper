@@ -1,5 +1,5 @@
 import { WASI } from 'node:wasi';
-import { Worker, threadId, workerData, parentPort } from 'node:worker_threads';
+import { Worker, threadId, parentPort,/* workerData, */ } from 'node:worker_threads';
 const namespaces = {};
 const MAX_UINT32 = Math.pow(2, 32) - 1;
 const MAX_INT32 = Math.pow(2, 31) - 1;
@@ -12,12 +12,15 @@ const randomId = () => Math.floor(Math.random() * MAX_UINT32).toString(36);
  */
 class WrapperInstance {
 	namespace;
-	role;				//"wasi_main" or "wasi_worker"
-	atomicArray;		//for all WrapperInstance,created by js main thread
-	wasmModule;			//for all wasi workers,created by js main thread
-	memory;				//for all wasi workers,created by js main thread
-	mainWorker;			//for js main thread
-	threadWorkers = [];	//for js main thread
+	role;				//"wasi_main" or "wasi_helper" or "wasi_worker"
+	atomicArray;		//for all roles
+	wasiOptions;		//for "wasi_main" and "wasi_worker"
+	wasmModule;			//for "wasi_main" and "wasi_worker"
+	memory;				//for "wasi_main" and "wasi_worker"
+	helperWorkerPort;	//for "wasi_main" and "wasi_worker"
+	helperWorker;		//for "wasi_main"
+	threadWorkers = [];	//for "wasi_helper"
+	threadFile;			//for "wasi_helper"
 	constructor(namespace, role) {
 		this.namespace = namespace;
 		this.role = role;
@@ -34,7 +37,6 @@ class WrapperInstance {
 			if (Atomics.compareExchange(array, i, 0, MIN_INT32) === 0) {
 				return i;
 			}
-
 		}
 	}
 	releaseWaitIdx(idx) {//release the atomicArray position
@@ -47,15 +49,15 @@ class WrapperInstance {
 		if (stat === 'not-equal') {
 			throw (new Error('invalid waiting call'));
 		}
-		const o = {
+		const ret = {
 			stat,
 			code: Atomics.load(array, idx),
 		};
 		this.releaseWaitIdx(idx);
-		return o;
+		return ret;
 	}
 	finishAtIdx(idx, code = 1) {//value{ 0:empty, MIN_INT32:waiting, 1:default finished, other values are custom }
-		// threadDebug('done at', idx);
+		threadDebug('done at', idx);
 		const array = this.atomicArray;
 		if (code === MIN_INT32 || code === 0) throw (new Error(`code ${code} is reserved`));
 		Atomics.compareExchange(array, idx, MIN_INT32, code);
@@ -72,6 +74,121 @@ class WrapperInstance {
 		delete namespaces[namespace];
 	}
 }
+
+function initWrapper(data) {
+	const {
+		namespace,
+		role,
+		atomicBuffer, wasmModule, memory,
+		wasiOptions, threadFile,
+	} = data;
+	if (!role || !namespace) throw (new Error('Not a worker created by "wasi helper"'));
+	let wrapper = WrapperInstance.create(namespace, role);
+	threadDebug(`init role:${role},tid:${threadId}`);
+	wrapper.wasmModule = wasmModule;
+	if (!wrapper.wasmModule) throw (new Error('wasmModule not found'));
+	wrapper.atomicArray = new Int32Array(atomicBuffer);
+	wrapper.memory = memory;
+	wrapper.wasiOptions = wasiOptions;
+	wrapper.threadFile = threadFile;
+	return wrapper;
+}
+function initThreadData(worker, role, wrapperData, extraData = {}) {
+	const {
+		namespace,
+		atomicArray,
+		memory,
+		wasmModule,
+		wasiOptions,
+		threadFile,
+	} = wrapperData;
+	worker.postMessage({
+		namespace,
+		opt: 'initThreadData',
+		data: {
+			namespace,
+			role,
+			wasiOptions,
+			atomicBuffer: atomicArray.buffer,
+			wasmModule,
+			memory,
+			threadFile,
+			...extraData
+		}
+	});
+}
+
+async function initWasi(wrapper, data, configFunc) {
+	const {
+		namespace,
+		role,
+	} = wrapper;
+	const {
+		destroy,
+		initMethod,//for wasi_main
+		wasiOptions,//for wasi_main and wasi_worker
+		instanceAddr,//for wasi_worker
+	} = data;
+	if (!role || !namespace) throw (new Error('Not a worker created by "wasi helper"'));
+	let {
+		//(optional) additional importObject for WebAssembly.instantiate method
+		wasmImports = {},
+
+		//(optional) custom wasi instance,if presented,wasiOptions from initWasiMain config will be ignored
+		wasi,
+
+		//(optional) do not run "wasi.start" on the instance
+		noWasiStart = false,
+	} = configFunc ? await configFunc(namespace, role) : {};
+	if (!wasi && !wasiOptions) throw (new Error('wasiOptions or wasi is required'));
+	if (wasi && wasiOptions) throw (new Error('wasiOptions and wasi can not be both provided'));
+
+	const isWasiMain = (role === 'wasi_main');
+	const isWasiWorker = (role === 'wasi_worker');
+
+	// init wasi, see: 
+	// https://github.com/WebAssembly/wasi-threads
+	// https://nodejs.org/docs/latest-v20.x/api/wasi.html#new-wasioptions
+	if (!wasi)
+		wasi = new WASI({ ...wasiOptions });
+	const importObject = {
+		wasi,
+		...wasi.getImportObject(),
+	};
+	deepAssign(importObject, wasmImports);
+	importObject.wasi["thread-spawn"] = (instanceAddr) => {
+		//instanceAddr is the parameter to pass to wasi_thread_start, representing the memory address of a new thread instance entry
+		//According to the wasi standard, a thread-spawn function needs to be provided for the instance to start a new thread
+		//PostMessage to the main process to create a new worker and use an Atomic lock to wait for the result
+		const waitAt = wrapper.findWaitIdx();
+		if (waitAt === undefined) throw (new Error('cannot get a waiting index'));
+		wrapper.helperWorkerPort.postMessage({ namespace, opt: 'createThread', instanceAddr, waitAt });
+		const result = wrapper.waitAtIdx(waitAt, 1000);
+		if (result.stat !== 'ok' || result.code < 0) throw (new Error(`thread-spawn failed: ${result.stat}, code:${result.code}`));
+		return result.code;//return the thread id
+	};
+	const instance = await WebAssembly.instantiate(wrapper.wasmModule, { env: { memory: wrapper.memory }, ...importObject });
+	wrapper.helperWorkerPort.postMessage({
+		namespace,
+		opt: 'threadReady',
+	});
+	threadDebug(isWasiMain ? `==== starting wasi_main ==== ` : `==== starting wasi_worker: instanceAddr:${instanceAddr} ==== `);
+	if (isWasiMain) {
+		if (!noWasiStart) wasi.start(instance);//when "wasiOptions.returnOnExit" is true, nodejs requires wasi.start to be executed
+		if (initMethod && instance.exports[initMethod]) {//the extra initMethod
+			instance.exports[initMethod]();
+		}
+	} else if (isWasiWorker) {
+		if (!noWasiStart) wasi.start(instance);//when "wasiOptions.returnOnExit" is true, nodejs requires wasi.start to be executed
+		let { wasi_thread_start } = instance.exports;
+		wasi_thread_start(threadId, instanceAddr);
+	} else {
+		throw (new Error('Unknown role'));
+	}
+	threadDebug(`**** ending thread **** `);
+	return instance;//return the wasm instance
+}
+
 
 /* for main js thread */
 /**
@@ -95,6 +212,11 @@ class WrapperInstance {
  * 		maximum: 4096,
  * }
  * }} config
+ * @param {function(namespace,role):{
+ * 	wasmImports? : {},		//(optional) additional importObject for WebAssembly.instantiate method
+ *	wasi? : WASI,			//(optional) custom wasi instance,if presented,wasiOptions from main thread will be ignored
+ *	noWasiStart? : false,	//(optional) do not run wasi.start on the instance
+ * }} wasiConfigFunc
  */
 export async function initWasiMain({
 	//the js file that initializes the wasm main thread
@@ -128,219 +250,175 @@ export async function initWasiMain({
 		maximum: 4096,
 		//share:true,will be add automatically
 	}
-} = configObj) {
-	if (namespaces[namespace]) throw (new Error(`Already initialized as ${namespace}.${namespaces[namespace].role}`));
-	if (!wasmFile) throw (new Error('wasmFile is required'));
-	const role = 'wasi_main';
-	//if wasmFile is a file path,read it as a buffer
-	if (typeof wasmFile === 'string') {
-		const fs = await import('node:fs');
-		wasmFile = fs.readFileSync(wasmFile);
-	}
-	const wrapper = WrapperInstance.create(namespace, role);
-	wrapper.memory = new WebAssembly.Memory({
-		...memorySetting,
-		shared: true,
-	});
-	wasmModule = wrapper.wasmModule = (wasmModule || await WebAssembly.compile(wasmFile));
-	const sharedBuffer =
-		(new WebAssembly.Memory({//get 1 page
-			initial: 1,
-			maximum: 1,
-			shared: true,
-		})).buffer;
-	wrapper.atomicArray = new Int32Array(sharedBuffer);
-	wrapper.atomicArray[0] = 1;
-	if (wrapper.atomicArray.length >= MAX_INT32) {
-		throw (new Error(`Atomic array length ${wrapper.atomicArray.length} is too large, must be less than ${MAX_INT32}`));
-	}
-	const mainWorker = wrapper.mainWorker = new Worker(entryFile);
-	mainWorker.role = role;
-	initThreadData(mainWorker, role);
-	handleWorker(mainWorker);
-
-	function initThreadData(worker, role, extraData = {}) {
-		worker.postMessage({
+} = configObj,
+	wasiConfigFunc) {
+	return new Promise(async (instanceCreateDone, instanceCreateFail) => {
+		if (namespaces[namespace]) throw (new Error(`Already initialized as ${namespace}.${namespaces[namespace].role}`));
+		if (!wasmFile) throw (new Error('wasmFile is required'));
+		const role = 'wasi_main';
+		//if wasmFile is a file path,read it as a buffer
+		if (typeof wasmFile === 'string') {
+			const fs = await import('node:fs');
+			wasmFile = fs.readFileSync(wasmFile);
+		}
+		wasmModule = (wasmModule || await WebAssembly.compile(wasmFile));
+		const wrapper = initWrapper({
 			namespace,
-			opt: 'initThreadData',
-			data: {
-				namespace,
-				role,
-				wasiOptions,
-				atomicBuffer: wrapper.atomicArray.buffer,
-				wasmModule,
-				memory: wrapper.memory,
-				initMethod,
-				...extraData
-			}
+			role,
+			atomicBuffer: (new WebAssembly.Memory({//get 1 page
+				initial: 1,
+				maximum: 1,
+				shared: true,
+			})).buffer,
+			memory: new WebAssembly.Memory({
+				...memorySetting,
+				shared: true,
+			}),
+			wasmModule,
+			wasiOptions,
+			threadFile,
 		});
-	}
-	function handleWorker(worker) {//receive worker messages
-		worker.on('message', msg => {
-			// threadDebug('msg from worker', msg);
-			if (typeof msg !== 'object' || msg?.namespace !== namespace) return;
+		wrapper.atomicArray[0] = 1;// init rolling id index
+		if (wrapper.atomicArray.length >= MAX_INT32) {
+			throw (new Error(`Atomic array length ${wrapper.atomicArray.length} is too large, must be less than ${MAX_INT32}`));
+		}
+		const helperWorker
+			= wrapper.helperWorkerPort
+			= wrapper.helperWorker
+			= new Worker('./helper.mjs', {
+				stdout: false,
+				stderr: false,
+			});
+		function destroy() {
+			if (!wrapper) return;
+			if (!WrapperInstance.get(wrapper.namespace)) {
+				throw (new Error(`Namespace ${wrapper.namespace} not found`));
+			}
+			wrapper.helperWorkerPort.postMessage({
+				namespace: wrapper.namespace,
+				opt: 'destroy',
+			});
+			WrapperInstance.destroy(wrapper.namespace);
+		}
+		async function startWasi() {
+			try {
+				const instance = await initWasi(wrapper, { destroy, initMethod, wasiOptions }, wasiConfigFunc);
+				instance.destroyThreadPool = destroy;
+				instanceCreateDone(instance);
+			} catch (err) {
+				instanceCreateFail(err);
+			}
+		}
+		initThreadData(helperWorker, 'wasi_helper', wrapper);
+		helperWorker.on('message', msg => {
+			if (typeof msg !== 'object' || (msg.namespace !== namespace)) return;
 			switch (msg.opt) {
-				case 'createThread':
-					createThread({
-						instanceAddr: msg.instanceAddr,
-						waitAt: msg.waitAt,
-					});
+				case 'helperReady':
+					startWasi();
 					break;
-				case 'threadReady':
-					if (worker.waitAt) wrapper.finishAtIdx(worker.waitAt, worker.threadId);
-					worker.waitAt = 0;
 			}
+		}).on('error', err => {
+			console.log('helperWorker error', err);
 		});
-		worker.on('exit', (code) => {
-			if (worker.role === 'wasi_main') {
-				threadDebug('wasi_main exit');
-				wrapper.mainWorker = null;
-				WrapperInstance.destroy(namespace);
-				//let thread workers destroy if wasi_main exits
-				for (let w of wrapper.threadWorkers) {
-					w.postMessage({
-						namespace,
-						opt: 'destroy'
-					});
-				}
-			} else {
-				threadDebug('wasi_worker exit');
-				const idx = wrapper.threadWorkers.indexOf(worker);
-				if (idx > -1) wrapper.threadWorkers.splice(idx, 1);
-			}
-		});
-	}
-	function createThread(args) {
-		const role = 'wasi_worker';
-		const { waitAt, instanceAddr } = args;
-		const threadWorker = new Worker(threadFile);
-		threadWorker.role = role;
-		threadWorker.waitAt = waitAt;
-		wrapper.threadWorkers.push(threadWorker);
-		initThreadData(threadWorker, role, { instanceAddr });
-		handleWorker(threadWorker);
-	}
+	});
 }
 /**
  * init for worker threads
  * @export
  * @param {function(namespace,role):{
  * 	wasmImports? : {},		//(optional) additional importObject for WebAssembly.instantiate method
- *	destroyWhenEnd? : true,	//(optional) set to false if you don't want the namespace be auto destroyed when the entry method ends
  *	wasi? : WASI,			//(optional) custom wasi instance,if presented,wasiOptions from main thread will be ignored
  *	noWasiStart? : false,	//(optional) do not run wasi.start on the instance
- * }} configFunc
+ * }} wasiConfigFunc
  * @returns {Promise<wasmModule>}  
  */
-export async function initWasiWorker(configFunc) {
-	threadDebug(`thread started`);
-	let wrapper;
-	let instanceCreateDone, instanceCreateFail;
-	parentPort.addListener('message', handleMessage);
-	async function handleMessage(msg) {
-		// threadDebug('msg from main', msg);
-		if (typeof msg !== 'object' || (wrapper?.namespace && (msg.namespace !== wrapper.namespace))) return;
-		switch (msg.opt) {
-			case 'initThreadData'://初始化数据
-				try {
-					const instance = await initWasi(msg.data);
-					instanceCreateDone(instance);
-				} catch (err) {
-					instanceCreateFail(err);
-				}
-				break;
-			case 'destroy':
-				destroy();
-		}
-	}
-
-	async function initWasi(data) {
-		const {
-			namespace,
-			role,
-			initMethod,//for wasi_main
-			wasiOptions,//for wasi_main and wasi_worker
-			atomicBuffer, wasmModule, memory,//for wasi_main and wasi_worker
-			instanceAddr,//for wasi_worker
-		} = data;
-		if (!role || !namespace) throw (new Error('Not a worker created by "initWasiMain"'));
-		let {
-			//(optional) additional importObject for WebAssembly.instantiate method
-			wasmImports = {},
-
-			//(optional) set to false if you don't want the namespace to be auto destroyed when the entry method ends
-			destroyWhenEnd = true,
-
-			//(optional) custom wasi instance,if presented,wasiOptions from initWasiMain config will be ignored
-			wasi,
-
-			//(optional) do not run "wasi.start" on the instance
-			noWasiStart = false,
-		} = configFunc ? await configFunc(namespace, role) : {};
-		if (!wasi && !wasiOptions) throw (new Error('wasiOptions or wasi is required'));
-		if (wasi && wasiOptions) throw (new Error('wasiOptions and wasi can not be both provided'));
-		wrapper = WrapperInstance.create(namespace, role);
-		threadDebug(`init role:${role},tid:${threadId}`);
-		const isWasiMain = (role === 'wasi_main');
-		const isWasiWorker = (role === 'wasi_worker');
-		wrapper.atomicArray = new Int32Array(atomicBuffer);
-		wrapper.wasmModule = wasmModule;
-		wrapper.memory = memory;
-		if (!wrapper.wasmModule) throw (new Error('wasmModule not found'));
-		// init wasi, see: 
-		// https://github.com/WebAssembly/wasi-threads
-		// https://nodejs.org/docs/latest-v20.x/api/wasi.html#new-wasioptions
-		if (!wasi)
-			wasi = new WASI({ ...wasiOptions });
-		const importObject = {
-			wasi,
-			...wasi.getImportObject(),
-		};
-		deepAssign(importObject, wasmImports);
-		importObject.wasi["thread-spawn"] = (instanceAddr) => {
-			//instanceAddr is the parameter to pass to wasi_thread_start, representing the memory address of a new thread instance entry
-			//According to the wasi standard, a thread-spawn function needs to be provided for the instance to start a new thread
-			//PostMessage to the main process to create a new worker and use an Atomic lock to wait for the result
-			const waitAt = wrapper.findWaitIdx();
-			parentPort.postMessage({ namespace, opt: 'createThread', instanceAddr, waitAt });
-			const result = wrapper.waitAtIdx(waitAt, 1000);
-			if (result.stat !== 'ok' || result.code < 0) throw (new Error(`thread-spawn failed: ${result.stat}, code:${result.code}`));
-			return result.code;//return the thread id
-		};
-		const instance = await WebAssembly.instantiate(wrapper.wasmModule, { env: { memory: wrapper.memory }, ...importObject });
-		parentPort.postMessage({
-			namespace,
-			opt: 'threadReady',
-		});
-		threadDebug(isWasiMain ? `==== starting wasi_main ==== ` : `==== starting wasi_worker: instanceAddr:${instanceAddr} ==== `);
-		let { wasi_thread_start } = instance.exports;
-		if (isWasiMain) {
-			if (!noWasiStart) wasi.start(instance);//when "wasiOptions.returnOnExit" is true, nodejs requires wasi.start to be executed
-			if (initMethod && instance.exports[initMethod]) {//the extra initMethod
-				instance.exports[initMethod]();
+export async function initWasiWorker(wasiConfigFunc) {
+	return new Promise((instanceCreateDone, instanceCreateFail) => {
+		threadDebug(`thread started`);
+		let wrapper;
+		parentPort.addListener('message', handleMessage);
+		async function handleMessage(msg) {
+			// threadDebug('msg from main', msg);
+			if (typeof msg !== 'object' || (wrapper?.namespace && (msg.namespace !== wrapper.namespace))) return;
+			switch (msg.opt) {
+				case 'initThreadData'://初始化数据
+					wrapper = initWrapper(msg.data);
+					if (wrapper.role === 'wasi_worker') {
+						wrapper.helperWorkerPort = parentPort;
+						try {
+							const instance = await initWasi(wrapper, { destroy, ...msg.data }, wasiConfigFunc);
+							instanceCreateDone(instance);
+						} catch (err) {
+							instanceCreateFail(err);
+						}
+					} else if (wrapper.role === 'wasi_helper') {
+						helperMessages(parentPort);
+						parentPort.postMessage({
+							namespace: wrapper.namespace,
+							opt: 'helperReady',
+						})
+					}
+					break;
+				case 'destroy':
+					destroy();
+					break;
 			}
-		} else if (isWasiWorker) {
-			if (!noWasiStart) wasi.start(instance);//when "wasiOptions.returnOnExit" is true, nodejs requires wasi.start to be executed
-			wasi_thread_start(threadId, instanceAddr);
-		} else {
-			throw (new Error('Unknown role'));
 		}
-		threadDebug(`**** ending thread`);
-		if (destroyWhenEnd) {
-			destroy();
+
+		function destroy() {
+			if (!wrapper) return;
+			WrapperInstance.destroy(wrapper.namespace);
+			parentPort.removeListener('message', handleMessage);
 		}
-		return instance;//return the wasm instance
-	}
-	function destroy() {
-		if (!wrapper) return;
-		WrapperInstance.destroy(wrapper.namespace);
-		parentPort.removeListener('message', handleMessage);
-	}
-	return new Promise((ok, fail) => {
-		instanceCreateDone = ok;
-		instanceCreateFail = fail;
+		function createThread(args) {//wasi_helper
+			const role = 'wasi_worker';
+			const { waitAt, instanceAddr } = args;
+			const threadWorker = new Worker(wrapper.threadFile);
+			threadWorker.role = role;
+			threadWorker.waitAt = waitAt;
+			wrapper.threadWorkers.push(threadWorker);
+			initThreadData(threadWorker, role, wrapper, { instanceAddr });
+			helperMessages(threadWorker);
+			threadWorker.once('exit', (code) => {
+				threadDebug('wasi_worker exit');
+				const idx = wrapper.threadWorkers.indexOf(threadWorker);
+				if (idx > -1) wrapper.threadWorkers.splice(idx, 1);
+			});
+		}
+		function helperMessages(worker) {//receive worker messages
+			function handle(msg) {
+				// threadDebug('msg from worker', msg);
+				switch (msg.opt) {
+					case 'createThread':
+						createThread({
+							instanceAddr: msg.instanceAddr,
+							waitAt: msg.waitAt,
+						});
+						break;
+					case 'threadReady':
+						if (worker.waitAt) wrapper.finishAtIdx(worker.waitAt, worker.threadId);
+						worker.waitAt = 0;
+						break;
+					case 'destroy':
+						for (let w of wrapper.threadWorkers) {
+							w.postMessage({
+								namespace: wrapper.namespace,
+								opt: 'destroy',
+							});
+						}
+						worker.removeListener('message', handle);
+						break;
+				}
+			}
+			worker.on('message', handle);
+		}
 	});
 }
+
+/* function portPair() {
+	const channel = new MessageChannel();
+	return [channel.port1, channel.port2];
+} */
 function deepAssign(target, source) {
 	for (let key in source) {
 		if (typeof source[key] === 'object' && source[key] !== null) {

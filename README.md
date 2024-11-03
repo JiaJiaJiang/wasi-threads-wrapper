@@ -23,11 +23,13 @@ It's very simple to use, just call the provided initialization method in the mai
 	const { isMainThread } = require('node:worker_threads');
 
 	if (isMainThread) {//the script is running in the js main thread
-		await initWasiMain({
+		const wasm=await initWasiMain({
 			entryFile: __filename,//set the wasi main thread worker js file, here is still this file
 			wasmFile: 'path/to/wasmfile.wasm',//set the wasm file path or buffer
-			initMethod: 'main2',// it's the solution for wasi that force you to calling wasi.start(), just make another "main" and leave the origin one empty
+			// initMethod: 'main2',// it's the solution for wasi that force you to calling wasi.start(), just make another "main" and leave the origin one empty
 		});
+		wasm.exports.test();
+		wasm.destroyThreadPool();
 	} else {//the script is running in the js worker
 		await initWasiWorker();//this method accepts a config function, ses below
 	}
@@ -79,15 +81,15 @@ async function initWasiMain({
 		maximum: 4096,
 		//share:true,will be add automatically
 	}
-} = configObj)
+} = configObj,wasiConfigFunc);
 ```
 
 ```javascript
 //config for initWasiWorker
-export async function initWasiWorker(configFunc);
+export async function initWasiWorker(wasiConfigFunc);
 
-//here is a configFunc example
-async function configFunc(namespace, role){
+//here is a wasiConfigFunc example
+async function wasiConfigFunc(namespace, role){
 	//namespace is set by you in initWasiMain config
 	/* 
 	role can be "wasi_main" or "wasi_worker"
@@ -98,9 +100,6 @@ async function configFunc(namespace, role){
 	return {
 		//(optional) additional importObject for WebAssembly.instantiate method
 		wasmImports = {},
-		
-		//(optional) set to false if you don't want the namespace to be auto destroyed when the entry method ends
-		destroyWhenEnd = true,
 
 		//(optional) custom wasi instance,if presented,wasiOptions from initWasiMain config will be ignored
 		wasi,
