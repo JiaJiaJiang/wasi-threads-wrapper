@@ -4,7 +4,7 @@ This is a wrapper library for creating threads in wasm-wasi, allowing normal syn
 
 **WHY?** In Javascript, creating a worker is asynchronous, while creating a thread in some programming languages is synchronous. So in the thread that the wasm calls thread-spawn, js cannot complete the operation of creating a worker (because js is blocked by wasm and cannot finish the event loop), so such a thing is needed to indirectly create a thread through inter-thread communication and Atomic lock.
 
-**HOW?** The basic principle is to move the wasm instance which creates threads to a worker, and then the methods provided by this package will call the main js thread to create workers, and use an Atomic lock to wait for the thread to be created.
+**HOW?** The basic principle is to create a helper worker, and then the methods provided by this package will call the helper thread to create workers, and use an Atomic lock to wait for the thread to be created.
 
 Now this library is temporarily only available for nodejs.
 
@@ -29,9 +29,9 @@ It's very simple to use, just call the provided initialization method in the mai
 			// initMethod: 'main2',// it's the solution for wasi that force you to calling wasi.start(), just make another "main" and leave the origin one empty
 		});
 		wasm.exports.test();
-		wasm.destroyThreadPool();
+		wasm.destroyThreads(false|true);//workers will be refed by MessageChannel listener, if you don't need the workers, call this method to release them, set the argument to ture for force terminating.
 	} else {//the script is running in the js worker
-		await initWasiWorker();//this method accepts a config function, ses below
+		const wasm = await initWasiWorker();//this method accepts a config function, ses below
 	}
 })();
 

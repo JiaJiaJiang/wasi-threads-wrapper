@@ -289,7 +289,7 @@ export async function initWasiMain({
 				stdout: false,
 				stderr: false,
 			});
-		function destroy() {
+		function destroy(force = false) {
 			if (!wrapper) return;
 			if (!WrapperInstance.get(wrapper.namespace)) {
 				throw (new Error(`Namespace ${wrapper.namespace} not found`));
@@ -297,13 +297,14 @@ export async function initWasiMain({
 			wrapper.helperWorkerPort.postMessage({
 				namespace: wrapper.namespace,
 				opt: 'destroy',
+				force,
 			});
 			WrapperInstance.destroy(wrapper.namespace);
 		}
 		async function startWasi() {
 			try {
 				const instance = await initWasi(wrapper, { destroy, initMethod, wasiOptions }, wasiConfigFunc);
-				instance.destroyThreadPool = destroy;
+				instance.destroyThreads = destroy;
 				instanceCreateDone(instance);
 			} catch (err) {
 				instanceCreateFail(err);
@@ -401,10 +402,14 @@ export async function initWasiWorker(wasiConfigFunc) {
 						break;
 					case 'destroy':
 						for (let w of wrapper.threadWorkers) {
-							w.postMessage({
-								namespace: wrapper.namespace,
-								opt: 'destroy',
-							});
+							if (msg.force) {
+								w.terminate();
+							} else {
+								w.postMessage({
+									namespace: wrapper.namespace,
+									opt: 'destroy',
+								});
+							}
 						}
 						worker.removeListener('message', handle);
 						break;
